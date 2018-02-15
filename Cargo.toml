@@ -1,0 +1,15 @@
+[package]
+name = "dns-watch"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["Stephen Connolly <stephen.alan.connolly@gmail.com>"]
+description = """
+Performs DNS lookups and then writes a file from a mustache template using the DNS lookups
+"""
+
+[dependencies]
+getopts = "0.2.17"
+domain = "0.2.2"
+mustache = "0.9.0"
+serde = "1.0.27"
+futures = "0.1.18"
