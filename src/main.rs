@@ -16,8 +16,10 @@ use std::io::prelude::*;
 use std::str::FromStr;
 use std::error::Error;
 use std::collections::HashMap;
+use std::time::Duration;
 use domain::bits::DNameBuf;
 use domain::resolv::Resolver;
+use domain::resolv::conf::ResolvConf;
 use domain::resolv::lookup::lookup_host;
 use std::process::{Command, Stdio};
 
@@ -30,35 +32,57 @@ fn print_usage(program: &str, opts: Options) {
     );
 }
 
-fn evaluate(matches: &Matches) -> Data {
+fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Data {
     let mut data = MapBuilder::new();
     for const_var in matches.opt_strs("c") {
         let mut splitter = const_var.splitn(2, '=');
         data = data.insert_str(splitter.next().unwrap(), splitter.next().unwrap());
     }
+    let mut conf = ResolvConf::default();
+    conf.timeout = Duration::from_millis(timeout);
     for host_var in matches.opt_strs("v") {
         let mut splitter = host_var.splitn(2, ':');
         let alias_name: &str = splitter.next().unwrap();
         let host_name: &str = splitter.next().unwrap_or_else(|| alias_name.clone());
-        data = data.insert_vec(alias_name, |builder| {
-            let response = Resolver::run(|resolv| {
+        data = data.insert_vec(alias_name, |builder| match Resolver::run_with_conf(
+            conf.clone(),
+            |resolv| {
                 let host = DNameBuf::from_str(host_name.clone()).unwrap();
                 lookup_host(resolv, host)
-            });
-            let mut b = builder;
-            if response.is_ok() {
+            },
+        ) {
+            Ok(response) => {
                 let mut addrs = response
-                    .unwrap()
                     .iter()
                     .filter(|x| x.is_ipv4())
                     .map(|addr| addr.clone().to_string())
                     .collect::<Vec<_>>();
                 addrs.sort_by(|a, b| a.cmp(b));
+                if debug {
+                    println!(
+                        "DEBUG: {} = {} => {:?}",
+                        alias_name.clone(),
+                        host_name.clone(),
+                        addrs.clone()
+                    )
+                }
+                let mut b = builder;
                 for addr in addrs {
                     b = b.push_str(addr)
                 }
+                b
             }
-            b
+            Err(e) => {
+                if debug {
+                    println!(
+                        "DEBUG: {} = {} => [] : {}",
+                        alias_name.clone(),
+                        host_name.clone(),
+                        e
+                    )
+                }
+                builder
+            }
         });
     }
     data.build()
@@ -104,15 +128,48 @@ fn main() {
     let program = args[0].clone();
 
     let mut opts = Options::new();
-    opts.optmulti("v", "var", "define a host variable", "NAME[:HOST]");
-    opts.optmulti("c", "const", "define a constant", "NAME=VALUE");
+    opts.optmulti(
+        "v",
+        "var",
+        "define a host variable, N, with the value being the resolved A record addresses of HOST. \
+            If HOST is omitted then assume N is the same as the hostname, \
+            in other words '--var www.example.com' is the same as \
+            '--var www.example.com:www.example.com'.",
+        "N[:HOST]",
+    );
+    opts.optmulti(
+        "c",
+        "const",
+        "define a constant, N, with the value VAL",
+        "N=VAL",
+    );
     opts.optopt(
         "w",
         "watch",
         "run CMD every time the template is updated",
         "CMD",
     );
-    opts.optopt("o", "", "set output file name", "NAME");
+    opts.optopt(
+        "o", 
+        "out", 
+        "set output file name. Use '--out -' to send the output to standard out. \
+            If not specified then the name will be inferred from the input file name: \
+            input files with a name ending in '.mustache' will have the '.mustache' removed, \
+            otherwise '.out' will be appended to the input file name.", 
+        "NAME"
+    );
+    opts.optopt(
+        "t",
+        "timeout",
+        "set the DNS lookup timeout (default: 1)",
+        "SECS",
+    );
+    opts.optopt(
+        "i",
+        "interval",
+        "specify the interval between rechecking DNS for changes when using --watch (default: 1)",
+        "SECS",
+    );
     opts.optflag("d", "debug", "enable debug output");
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
@@ -151,14 +208,32 @@ fn main() {
             name
         }
     };
+    let timeout: u64 = match matches.opt_str("t") {
+        Some(seconds) => {
+            match seconds.parse::<u64>() {
+                Ok(seconds) => seconds * 1000,
+                Err(_) => panic!("Could not parse supplied timeout"),
+            }
+        }
+        None => 1000,
+    };
     if matches.opt_present("w") {
         if output_file.eq("-") {
             panic!("Cannot use --watch with output to standard out");
         }
+        let interval: u64 = match matches.opt_str("i") {
+            Some(seconds) => {
+                match seconds.parse::<u64>() {
+                    Ok(seconds) => seconds * 1000,
+                    Err(_) => panic!("Could not parse supplied interval"),
+                }
+            }
+            None => 1000,
+        };
         let cmd = matches.opt_str("w").unwrap().clone();
         loop {
             let m = matches.clone();
-            let ctx = &evaluate(&m);
+            let ctx = &evaluate(&m, timeout, debug);
             let old_ctx = as_map(ctx);
             render(&template, ctx, &output_file);
             if debug {
@@ -211,18 +286,18 @@ fn main() {
                 });
             }
             while {
-                as_map(&evaluate(&m)).eq(&old_ctx)
+                as_map(&evaluate(&m, timeout, debug)).eq(&old_ctx)
             }
             {
                 if debug {
-                    println!("DEBUG: Sleep");
+                    println!("DEBUG: Sleep {}s", interval / 1000);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1000))
+                std::thread::sleep(Duration::from_millis(interval.clone()))
             }
         }
     } else {
         let m = matches.clone();
-        let ctx = &evaluate(&m);
+        let ctx = &evaluate(&m, timeout, debug);
         if output_file.eq("-") {
             template.render_data(&mut io::stdout(), ctx).expect(
                 "Template failed to render",
