@@ -6,29 +6,29 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+extern crate domain;
 extern crate getopts;
 extern crate handlebars;
 extern crate serde;
 extern crate serde_json;
-extern crate domain;
 
-use getopts::Options;
-use getopts::Matches;
-use std::env;
-use serde_json::Value;
-use handlebars::Handlebars;
-use std::fs::File;
-use std::path::Path;
-use std::io;
-use std::str::FromStr;
-use std::error::Error;
-use serde_json::map::Map;
-use std::time::Duration;
 use domain::bits::DNameBuf;
-use domain::resolv::Resolver;
 use domain::resolv::conf::ResolvConf;
 use domain::resolv::lookup::lookup_host;
+use domain::resolv::Resolver;
+use getopts::Matches;
+use getopts::Options;
+use handlebars::Handlebars;
+use serde_json::map::Map;
+use serde_json::Value;
+use std::env;
+use std::error::Error;
+use std::fs::File;
+use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
+use std::time::Duration;
 
 fn create_options() -> Options {
     let mut opts = Options::new();
@@ -149,13 +149,11 @@ fn render<'a>(handlebars: &'a Handlebars, template: &'a str, ctx: &'a Value, out
         Ok(file) => file,
     };
     match handlebars.render_to_write(template, &ctx, &mut file) {
-        Err(why) => {
-            panic!(
-                "couldn't render template {}: {}",
-                output_file,
-                why.description()
-            )
-        }
+        Err(why) => panic!(
+            "couldn't render template {}: {}",
+            output_file,
+            why.description()
+        ),
         Ok(file) => file,
     };
 }
@@ -165,14 +163,13 @@ fn fork_child(cmd: String, debug: bool) {
         .stdout(Stdio::null())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .spawn() {
-        Err(why) => {
-            panic!(
-                "couldn't spawn watch process {}: {}",
-                cmd,
-                why.description()
-            )
-        }
+        .spawn()
+    {
+        Err(why) => panic!(
+            "couldn't spawn watch process {}: {}",
+            cmd,
+            why.description()
+        ),
         Ok(child) => {
             if debug {
                 println!("DEBUG: watch process pid {} started", child.id());
@@ -195,8 +192,7 @@ fn fork_child(cmd: String, debug: bool) {
                 if debug {
                     println!(
                         "DEBUG: watch process pid {} terminated with {}",
-                        child_id,
-                        exit_status
+                        child_id, exit_status
                     );
                 }
                 0
@@ -244,12 +240,10 @@ fn main() {
         }
     };
     let timeout: u64 = match matches.opt_str("t") {
-        Some(seconds) => {
-            match seconds.parse::<u64>() {
-                Ok(seconds) => seconds * 1000,
-                Err(_) => panic!("Could not parse supplied timeout"),
-            }
-        }
+        Some(seconds) => match seconds.parse::<u64>() {
+            Ok(seconds) => seconds * 1000,
+            Err(_) => panic!("Could not parse supplied timeout"),
+        },
         None => 1000,
     };
     if matches.opt_present("w") {
@@ -257,12 +251,10 @@ fn main() {
             panic!("Cannot use --watch with output to standard out");
         }
         let interval: u64 = match matches.opt_str("i") {
-            Some(seconds) => {
-                match seconds.parse::<u64>() {
-                    Ok(seconds) => seconds * 1000,
-                    Err(_) => panic!("Could not parse supplied interval"),
-                }
-            }
+            Some(seconds) => match seconds.parse::<u64>() {
+                Ok(seconds) => seconds * 1000,
+                Err(_) => panic!("Could not parse supplied interval"),
+            },
             None => 1000,
         };
         let cmd = matches.opt_str("w").unwrap().clone();
