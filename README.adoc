@@ -1,12 +1,14 @@
 == dns-watch
 
-This is a simple helper utility that performs a DNS lookup of a list of hostnames and uses them to instantiate a mustache template.
+This is a simple helper utility that performs a DNS lookup of a list of hostnames and uses them to instantiate a handlebars template.
+
+See [handlebars-rust](https://sunng87.github.io/handlebars-rust/handlebars/index.html#built-in-helpers) for details of the supported helpers.
 
 Pair this with a HAProxy reload script and you can have a HAProxy docker image automatically discover `docker-compose` scaled services.
 
 === Example
 
-If we have a mustache template file like this
+If we have a handlebars template file like this
 
 [source]
 ----
@@ -16,15 +18,15 @@ frontend app
 
 backend api
     mode http
-{{#backend}}
-    server {{.}} {{.}}:8080 check
-{{/backend}}
+{{#each backend}}
+    server {{{this}}} {{{this}}}:8080 check
+{{/each}}
 
 backend ui
     mode http
-{{#frontend}}
-    server {{.}} {{.}}:8888 check
-{{/frontend}}
+{{#each frontend}}
+    server {{{this}}} {{{this}}}:8888 check
+{{/each}}
 ----
 
 Then running:
@@ -58,7 +60,7 @@ If you want to watch for changes then you can specify a command to execute every
 
 [source,bash]
 ----
-$ dns-watch -v frontend:frontend-service -v backend:backend-service -o haproxy.conf -w reload_haproxy.sh haproxy.conf.mustache
+$ dns-watch -v frontend:frontend-service -v backend:backend-service -o haproxy.conf -w reload_haproxy.sh haproxy.conf.hbs
 ----
 
 Which watch for DNS changes every second and run the `reload_haproxy.sh` if the template is written.
