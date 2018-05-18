@@ -69,6 +69,8 @@ fn create_options() -> Options {
         "specify the interval between rechecking DNS for changes when using --watch (default: 1)",
         "SECS",
     )
+    .optflag("f", "fast-start", "render empty DNS results first and then start DNS resolution (when using --watch)")
+    .optflag("", "use-millis", "all times are expressed in milliseconds not seconds")
     .optflag("d", "debug", "enable debug output")
     .optflag("h", "help", "print this help menu");
     opts
@@ -81,6 +83,23 @@ fn print_usage(program: &str, opts: Options) {
     println!(
         "Writes a file based on a handlebars template used to substitute in resolved ip addresses"
     );
+}
+
+fn evaluate_empty(matches: &Matches) -> Value {
+    let mut data = Map::new();
+    for const_var in matches.opt_strs("c") {
+        let mut splitter = const_var.splitn(2, '=');
+        data.insert(
+            splitter.next().unwrap().to_string(),
+            Value::String(splitter.next().unwrap().to_string()),
+        );
+    }
+    for host_var in matches.opt_strs("v") {
+        let mut splitter = host_var.splitn(2, ':');
+        let alias_name: &str = splitter.next().unwrap();
+        data.insert(alias_name.to_string(), Value::Null);
+    }
+    Value::Object(data)  
 }
 
 fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
@@ -239,9 +258,13 @@ fn main() {
             name
         }
     };
+    let time_multiplier = match matches.opt_present("use-millis") {
+        true => 1,
+        false => 1000
+    };
     let timeout: u64 = match matches.opt_str("t") {
         Some(seconds) => match seconds.parse::<u64>() {
-            Ok(seconds) => seconds * 1000,
+            Ok(seconds) => seconds * time_multiplier,
             Err(_) => panic!("Could not parse supplied timeout"),
         },
         None => 1000,
@@ -252,15 +275,20 @@ fn main() {
         }
         let interval: u64 = match matches.opt_str("i") {
             Some(seconds) => match seconds.parse::<u64>() {
-                Ok(seconds) => seconds * 1000,
+                Ok(seconds) => seconds * time_multiplier,
                 Err(_) => panic!("Could not parse supplied interval"),
             },
             None => 1000,
         };
+        let mut first = matches.opt_present("f");
         let cmd = matches.opt_str("w").unwrap().clone();
         loop {
             let m = matches.clone();
-            let ctx = &evaluate(&m, timeout, debug);
+            let ctx = & match first {
+                true => evaluate_empty(&m),
+                false => evaluate(&m, timeout, debug)
+            };
+            first = false;
             let old_ctx = ctx.clone();
             render(&handlebars, "template", ctx, &output_file);
             if debug {
