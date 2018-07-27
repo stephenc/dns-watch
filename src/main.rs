@@ -9,6 +9,7 @@
 extern crate domain;
 extern crate getopts;
 extern crate handlebars;
+extern crate meval;
 extern crate serde;
 extern crate serde_json;
 
@@ -18,7 +19,7 @@ use domain::resolv::lookup::lookup_host;
 use domain::resolv::Resolver;
 use getopts::Matches;
 use getopts::Options;
-use handlebars::Handlebars;
+use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
 use serde_json::map::Map;
 use serde_json::Value;
 use std::env;
@@ -29,6 +30,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
+use handlebars::JsonRender;
 
 fn create_options() -> Options {
     let mut opts = Options::new();
@@ -45,6 +47,11 @@ fn create_options() -> Options {
         "const",
         "define a constant, N, with the value VAL",
         "N=VAL",
+    ).optmulti(
+        "l",
+        "list",
+        "define a '=' separated list, N, with the values VAL1, VAL2, etc",
+        "N=VAL1=VAL2...",
     ).optopt(
         "w",
         "watch",
@@ -69,10 +76,10 @@ fn create_options() -> Options {
         "specify the interval between rechecking DNS for changes when using --watch (default: 1)",
         "SECS",
     )
-    .optflag("f", "fast-start", "render empty DNS results first and then start DNS resolution (when using --watch)")
-    .optflag("", "use-millis", "all times are expressed in milliseconds not seconds")
-    .optflag("d", "debug", "enable debug output")
-    .optflag("h", "help", "print this help menu");
+        .optflag("f", "fast-start", "render empty DNS results first and then start DNS resolution (when using --watch)")
+        .optflag("", "use-millis", "all times are expressed in milliseconds not seconds")
+        .optflag("d", "debug", "enable debug output")
+        .optflag("h", "help", "print this help menu");
     opts
 }
 
@@ -81,8 +88,17 @@ fn print_usage(program: &str, opts: Options) {
     println!("{}", opts.usage(&brief));
     println!();
     println!(
-        "Writes a file based on a handlebars template used to substitute in resolved ip addresses"
+        "Writes a file based on a handlebars template used to substitute in resolved ip addresses."
     );
+    println!();
+    println!("NOTE: handlebars support is provided by handlebars-rs");
+    println!("  * Mustache blocks are not supported, use if/each instead");
+    println!("  * Chained else is not supported");
+    println!();
+    println!("Custom helpers:");
+    println!("  * {{eval ...}} evaluates basic integer numeric expressions and return the result");
+    println!("    for example {{#each foo}}{{eval @index \"+100\"}},{{/each}} will add 100 to the");
+    println!("    @index values inside the loop");
 }
 
 fn evaluate_empty(matches: &Matches) -> Value {
@@ -94,12 +110,24 @@ fn evaluate_empty(matches: &Matches) -> Value {
             Value::String(splitter.next().unwrap().to_string()),
         );
     }
+    for list_var in matches.opt_strs("l") {
+        let mut splitter = list_var.splitn(2, '=');
+        data.insert(
+            splitter.next().unwrap().to_string(),
+            Value::Array(
+                splitter.next().unwrap().to_string()
+                    .split('=')
+                    .map(|val| Value::String(val.to_string()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
     for host_var in matches.opt_strs("v") {
         let mut splitter = host_var.splitn(2, ':');
         let alias_name: &str = splitter.next().unwrap();
         data.insert(alias_name.to_string(), Value::Null);
     }
-    Value::Object(data)  
+    Value::Object(data)
 }
 
 fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
@@ -109,6 +137,18 @@ fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
         data.insert(
             splitter.next().unwrap().to_string(),
             Value::String(splitter.next().unwrap().to_string()),
+        );
+    }
+    for list_var in matches.opt_strs("l") {
+        let mut splitter = list_var.splitn(2, '=');
+        data.insert(
+            splitter.next().unwrap().to_string(),
+            Value::Array(
+                splitter.next().unwrap().to_string()
+                    .split('=')
+                    .map(|val| Value::String(val.to_string()))
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     let mut conf = ResolvConf::default();
@@ -183,19 +223,19 @@ fn fork_child(cmd: String, debug: bool) {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Err(why) => panic!(
-            "couldn't spawn watch process {}: {}",
-            cmd,
-            why.description()
-        ),
-        Ok(child) => {
-            if debug {
-                println!("DEBUG: watch process pid {} started", child.id());
+        {
+            Err(why) => panic!(
+                "couldn't spawn watch process {}: {}",
+                cmd,
+                why.description()
+            ),
+            Ok(child) => {
+                if debug {
+                    println!("DEBUG: watch process pid {} started", child.id());
+                }
+                child
             }
-            child
-        }
-    };
+        };
     std::thread::spawn(move || {
         let child_id = child.id();
         match child.wait() {
@@ -220,6 +260,23 @@ fn fork_child(cmd: String, debug: bool) {
     });
 }
 
+fn eval_helper(h: &Helper, _: &Handlebars, _: &Context, _: &mut RenderContext, out: &mut Output) -> HelperResult {
+    let expr = h.params()
+        .iter()
+        .map(|v| {
+            v.value().render()
+        })
+        .collect::<Vec<String>>()
+        .join(" ");
+    let res = meval::eval_str(expr)
+        .map(|v| v as i64)
+        .map(|v| format!("{}", v))
+        .unwrap();
+    try!(out.write(&res));
+    Ok(())
+}
+
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
@@ -240,6 +297,7 @@ fn main() {
     let debug = matches.opt_present("d");
 
     let mut handlebars = Handlebars::new();
+    handlebars.register_helper("eval", Box::new(eval_helper));
     match handlebars.register_template_file("template", Path::new(&matches.free[0])) {
         Ok(_) => (),
         Err(f) => panic!(f.to_string()),
@@ -284,7 +342,7 @@ fn main() {
         let cmd = matches.opt_str("w").unwrap().clone();
         loop {
             let m = matches.clone();
-            let ctx = & match first {
+            let ctx = &match first {
                 true => evaluate_empty(&m),
                 false => evaluate(&m, timeout, debug)
             };
