@@ -2,7 +2,7 @@
 
 This is a simple helper utility that performs a DNS lookup of a list of hostnames and uses them to instantiate a handlebars template.
 
-See [handlebars-rust](https://sunng87.github.io/handlebars-rust/handlebars/index.html#built-in-helpers) for details of the supported helpers.
+See link:https://sunng87.github.io/handlebars-rust/handlebars/index.html#built-in-helpers[handlebars-rust] for details of the supported helpers.
 
 Pair this with a HAProxy reload script and you can have a HAProxy docker image automatically discover `docker-compose` scaled services.
 
