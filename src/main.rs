@@ -1,4 +1,4 @@
-// Copyright 2018 Stephen Connolly.
+// Copyright 2018-2019 Stephen Connolly.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE.txt or
 // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
@@ -13,15 +13,6 @@ extern crate meval;
 extern crate serde;
 extern crate serde_json;
 
-use domain::bits::DNameBuf;
-use domain::resolv::conf::ResolvConf;
-use domain::resolv::lookup::lookup_host;
-use domain::resolv::Resolver;
-use getopts::Matches;
-use getopts::Options;
-use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
-use serde_json::map::Map;
-use serde_json::Value;
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -29,8 +20,19 @@ use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::thread;
 use std::time::Duration;
+
+use domain::bits::DNameBuf;
+use domain::resolv::conf::ResolvConf;
+use domain::resolv::lookup::lookup_host;
+use domain::resolv::Resolver;
+use getopts::Matches;
+use getopts::Options;
+use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
 use handlebars::JsonRender;
+use serde_json::map::Map;
+use serde_json::Value;
 
 fn create_options() -> Options {
     let mut opts = Options::new();
@@ -79,7 +81,8 @@ fn create_options() -> Options {
         .optflag("f", "fast-start", "render empty DNS results first and then start DNS resolution (when using --watch)")
         .optflag("", "use-millis", "all times are expressed in milliseconds not seconds")
         .optflag("d", "debug", "enable debug output")
-        .optflag("h", "help", "print this help menu");
+        .optflag("h", "help", "print this help menu")
+        .optflag("V", "version", "print the version and exit");
     opts
 }
 
@@ -153,53 +156,76 @@ fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
     }
     let mut conf = ResolvConf::default();
     conf.timeout = Duration::from_millis(timeout);
-    for host_var in matches.opt_strs("v") {
+    let mut threads = Vec::new();
+    let host_vars = matches.opt_strs("v");
+    for host_var in host_vars {
+        let conf = conf.clone();
+        let debug = debug.clone();
         let mut splitter = host_var.splitn(2, ':');
-        let alias_name: &str = splitter.next().unwrap();
-        let host_name: &str = splitter.next().unwrap_or_else(|| alias_name.clone());
-        data.insert(
-            alias_name.to_string(),
-            match Resolver::run_with_conf(conf.clone(), |resolv| {
-                let host = DNameBuf::from_str(host_name.clone()).unwrap();
-                lookup_host(resolv, host)
-            }) {
-                Ok(response) => {
-                    let mut addrs = response
-                        .iter()
-                        .filter(|x| x.is_ipv4())
-                        .map(|addr| addr.clone().to_string())
-                        .collect::<Vec<_>>();
-                    addrs.sort_by(|a, b| a.cmp(b));
-                    if debug {
-                        println!(
-                            "DEBUG: {} = {} => {:?}",
-                            alias_name.clone(),
-                            host_name.clone(),
-                            addrs.clone()
-                        )
-                    }
-                    Value::Array(
-                        addrs
-                            .iter()
-                            .map(|addr| Value::String(addr.to_string()))
-                            .collect::<Vec<_>>(),
-                    )
-                }
-                Err(e) => {
-                    if debug {
-                        println!(
-                            "DEBUG: {} = {} => [] : {}",
-                            alias_name.clone(),
-                            host_name.clone(),
-                            e
-                        )
-                    }
-                    Value::Null
-                }
+        let alias_name = splitter.next().unwrap().to_string().clone();
+        let host_name = splitter.next().unwrap_or_else(|| alias_name.as_str()).to_string().clone();
+        threads.push(thread::spawn( move || {
+            let alias_value = resolve(debug, conf, alias_name.as_str(), host_name.as_str());
+            (alias_name, alias_value)
+        }));
+    }
+    for res in threads {
+        match res.join() {
+            Ok((alias_name, alias_value)) => {
+                data.insert(alias_name, alias_value);
             },
-        );
+            Err(e) => {
+                if debug {
+                    println!(
+                        "DEBUG: Join failed: {:?}",
+                        e
+                    );
+                }
+            }
+        }
     }
     Value::Object(data)
+}
+
+fn resolve(debug: bool, conf: ResolvConf, alias_name: &str, host_name: &str) -> Value {
+    match Resolver::run_with_conf(conf.clone(), |resolv| {
+        let host = DNameBuf::from_str(host_name.clone()).unwrap();
+        lookup_host(resolv, host)
+    }) {
+        Ok(response) => {
+            let mut addrs = response
+                .iter()
+                .filter(|x| x.is_ipv4())
+                .map(|addr| addr.clone().to_string())
+                .collect::<Vec<_>>();
+            addrs.sort_by(|a, b| a.cmp(b));
+            if debug {
+                println!(
+                    "DEBUG: {} = {} => {:?}",
+                    alias_name.clone(),
+                    host_name.clone(),
+                    addrs.clone()
+                )
+            }
+            Value::Array(
+                addrs
+                    .iter()
+                    .map(|addr| Value::String(addr.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        Err(e) => {
+            if debug {
+                println!(
+                    "DEBUG: {} = {} => [] : {}",
+                    alias_name.clone(),
+                    host_name.clone(),
+                    e
+                )
+            }
+            Value::Null
+        }
+    }
 }
 
 fn render<'a>(handlebars: &'a Handlebars, template: &'a str, ctx: &'a Value, output_file: &'a str) {
@@ -278,6 +304,7 @@ fn eval_helper(h: &Helper, _: &Handlebars, _: &Context, _: &mut RenderContext, o
 
 
 fn main() {
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
 
@@ -288,6 +315,10 @@ fn main() {
     };
     if matches.opt_present("h") {
         print_usage(&program, opts);
+        return;
+    }
+    if matches.opt_present("V") {
+        println!("{}", VERSION);
         return;
     }
     if matches.free.is_empty() {
