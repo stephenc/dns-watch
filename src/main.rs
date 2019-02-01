@@ -17,20 +17,23 @@ use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io;
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::string::String;
 use std::thread;
 use std::time::Duration;
 
-use domain::bits::DNameBuf;
-use domain::resolv::conf::ResolvConf;
+use domain::core::bits::name::Dname;
+use domain::resolv::lookup::lookup_addr;
 use domain::resolv::lookup::lookup_host;
-use domain::resolv::Resolver;
+use domain::resolv::stub::conf::ResolvConf;
+use domain::resolv::stub::resolver::StubResolver;
 use getopts::Matches;
 use getopts::Options;
-use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
 use handlebars::JsonRender;
+use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
 use serde_json::map::Map;
 use serde_json::Value;
 
@@ -39,50 +42,81 @@ fn create_options() -> Options {
     opts.optmulti(
         "v",
         "var",
-        "define a host variable, N, with the value being the resolved A record addresses of HOST. \
-            If HOST is omitted then assume N is the same as the hostname, \
-            in other words '--var www.example.com' is the same as \
-            '--var www.example.com:www.example.com'.",
-        "N[:HOST]",
-    ).optmulti(
+        "define a host variable, N, with the value being the resolved A record addresses of \
+         HOST. If HOST is omitted then assume N is the same as the hostname, \
+         in other words '--var www.example.com' is the same as \
+         '--var www.example.com:www.example.com'. Appending ':hn' or `:fqdn' to the host \
+         requests that a hostname lookup is performed on the returned IP addresses. For ':hn'\
+         only the hostname portion of successful lookups is used while ':fqdn' uses the \
+         fully qualified domain name. If reverse lookups are enabled but fail, the IP address \
+         will be used.",
+        "N[:HOST[:(hn)|(fqdn)]",
+    )
+    .optmulti(
         "c",
         "const",
         "define a constant, N, with the value VAL",
         "N=VAL",
-    ).optmulti(
+    )
+    .optmulti(
         "l",
         "list",
         "define a '=' separated list, N, with the values VAL1, VAL2, etc",
         "N=VAL1=VAL2...",
-    ).optopt(
+    )
+    .optopt(
         "w",
         "watch",
         "run CMD every time the template is updated",
         "CMD",
-    ).optopt(
+    )
+    .optopt(
         "o",
         "out",
         "set output file name. Use '--out -' to send the output to standard out. \
-            If not specified then the name will be inferred from the input file name: \
-            input files with a name ending in '.hbs' will have the '.hbs' removed, \
-            otherwise '.out' will be appended to the input file name.",
+         If not specified then the name will be inferred from the input file name: \
+         input files with a name ending in '.hbs' will have the '.hbs' removed, \
+         otherwise '.out' will be appended to the input file name.",
         "NAME",
-    ).optopt(
+    )
+    .optopt(
         "t",
         "timeout",
         "set the DNS lookup timeout (default: 1)",
         "SECS",
-    ).optopt(
+    )
+    .optopt(
         "i",
         "interval",
         "specify the interval between rechecking DNS for changes when using --watch (default: 1)",
         "SECS",
     )
-        .optflag("f", "fast-start", "render empty DNS results first and then start DNS resolution (when using --watch)")
-        .optflag("", "use-millis", "all times are expressed in milliseconds not seconds")
-        .optflag("d", "debug", "enable debug output")
-        .optflag("h", "help", "print this help menu")
-        .optflag("V", "version", "print the version and exit");
+    .optopt(
+        "",
+        "attempts",
+        "specify the number of attempts to retry DNS lookups (default: 1)",
+        "ATTEMPTS",
+    )
+    .optopt(
+        "",
+        "ndots",
+        "Number of dots before an initial absolute query is made. (default: 0)",
+        "NDOTS",
+    )
+    .optflag("", "recurse", "use recursive DNS queries")
+    .optflag(
+        "f",
+        "fast-start",
+        "render empty DNS results first and then start DNS resolution (when using --watch)",
+    )
+    .optflag(
+        "",
+        "use-millis",
+        "all times are expressed in milliseconds not seconds",
+    )
+    .optflag("d", "debug", "enable debug output")
+    .optflag("h", "help", "print this help menu")
+    .optflag("V", "version", "print the version and exit");
     opts
 }
 
@@ -118,10 +152,13 @@ fn evaluate_empty(matches: &Matches) -> Value {
         data.insert(
             splitter.next().unwrap().to_string(),
             Value::Array(
-                splitter.next().unwrap().to_string()
+                splitter
+                    .next()
+                    .unwrap()
+                    .to_string()
                     .split('=')
                     .map(|val| Value::String(val.to_string()))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
             ),
         );
     }
@@ -147,25 +184,60 @@ fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
         data.insert(
             splitter.next().unwrap().to_string(),
             Value::Array(
-                splitter.next().unwrap().to_string()
+                splitter
+                    .next()
+                    .unwrap()
+                    .to_string()
                     .split('=')
                     .map(|val| Value::String(val.to_string()))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
             ),
         );
     }
     let mut conf = ResolvConf::default();
-    conf.timeout = Duration::from_millis(timeout);
+    conf.options.timeout = Duration::from_millis(timeout);
+    conf.options.ndots = matches
+        .opt_str("ndots")
+        .map_or(0, |a| match a.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => 0,
+        });
+    conf.options.attempts = matches
+        .opt_str("attempts")
+        .map_or(1, |a| match a.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => 0,
+        });
+    conf.options.recurse = matches.opt_present("recurse");
+    conf.finalize();
     let mut threads = Vec::new();
     let host_vars = matches.opt_strs("v");
     for host_var in host_vars {
         let conf = conf.clone();
         let debug = debug.clone();
-        let mut splitter = host_var.splitn(2, ':');
+        let mut splitter = host_var.splitn(3, ':');
         let alias_name = splitter.next().unwrap().to_string().clone();
-        let host_name = splitter.next().unwrap_or_else(|| alias_name.as_str()).to_string().clone();
-        threads.push(thread::spawn( move || {
-            let alias_value = resolve(debug, conf, alias_name.as_str(), host_name.as_str());
+        let host_name = splitter
+            .next()
+            .unwrap_or_else(|| alias_name.as_str())
+            .to_string()
+            .clone();
+        let reverse_lookup = match splitter.next() {
+            Some(reverse) => match reverse.to_lowercase().as_str() {
+                "hn" => 1,
+                "fqdn" => 2,
+                _ => 0,
+            },
+            None => 0,
+        };
+        threads.push(thread::spawn(move || {
+            let alias_value = resolve(
+                debug,
+                conf,
+                alias_name.as_str(),
+                host_name.as_str(),
+                reverse_lookup,
+            );
             (alias_name, alias_value)
         }));
     }
@@ -173,13 +245,10 @@ fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
         match res.join() {
             Ok((alias_name, alias_value)) => {
                 data.insert(alias_name, alias_value);
-            },
+            }
             Err(e) => {
                 if debug {
-                    println!(
-                        "DEBUG: Join failed: {:?}",
-                        e
-                    );
+                    println!("DEBUG: Join failed: {:?}", e);
                 }
             }
         }
@@ -187,17 +256,32 @@ fn evaluate(matches: &Matches, timeout: u64, debug: bool) -> Value {
     Value::Object(data)
 }
 
-fn resolve(debug: bool, conf: ResolvConf, alias_name: &str, host_name: &str) -> Value {
-    match Resolver::run_with_conf(conf.clone(), |resolv| {
-        let host = DNameBuf::from_str(host_name.clone()).unwrap();
-        lookup_host(resolv, host)
-    }) {
+fn resolve(
+    debug: bool,
+    conf: ResolvConf,
+    alias_name: &str,
+    host_name: &str,
+    reverse_lookup: i32,
+) -> Value {
+    let host = Dname::from_str(host_name.clone()).unwrap();
+    match StubResolver::run_with_conf(conf.clone(), move |resolv| lookup_host(&resolv, &host)) {
         Ok(response) => {
-            let mut addrs = response
+            let ip_or_names = response
                 .iter()
                 .filter(|x| x.is_ipv4())
-                .map(|addr| addr.clone().to_string())
+                .map(|addr| {
+                    let conf = conf.clone();
+                    let reverse_lookup = reverse_lookup;
+                    thread::spawn(move || reverse_resolve(conf, reverse_lookup, addr))
+                })
                 .collect::<Vec<_>>();
+            let mut addrs = Vec::new();
+            for res in ip_or_names {
+                match res.join() {
+                    Ok(ip_or_name) => addrs.push(ip_or_name),
+                    Err(_) => (),
+                }
+            }
             addrs.sort_by(|a, b| a.cmp(b));
             if debug {
                 println!(
@@ -228,6 +312,37 @@ fn resolve(debug: bool, conf: ResolvConf, alias_name: &str, host_name: &str) -> 
     }
 }
 
+fn reverse_resolve(conf: ResolvConf, reverse_lookup: i32, addr: IpAddr) -> String {
+    match reverse_lookup {
+        2 => {
+            match StubResolver::run_with_conf(conf.clone(), move |resolv| {
+                lookup_addr(&resolv, addr)
+            }) {
+                Ok(fqdn) => match fqdn.iter().next() {
+                    Some(fqdn) => fqdn.clone().to_string(),
+                    None => addr.clone().to_string(),
+                },
+                Err(_) => addr.clone().to_string(),
+            }
+        }
+        1 => {
+            match StubResolver::run_with_conf(conf.clone(), move |resolv| {
+                lookup_addr(&resolv, addr)
+            }) {
+                Ok(fqdn) => match fqdn.iter().next() {
+                    Some(fqdn) => match fqdn.clone().to_string().split('.').next() {
+                        Some(hn) => hn.clone().to_string(),
+                        None => fqdn.clone().to_string(),
+                    },
+                    None => addr.clone().to_string(),
+                },
+                Err(_) => addr.clone().to_string(),
+            }
+        }
+        _ => addr.clone().to_string(),
+    }
+}
+
 fn render<'a>(handlebars: &'a Handlebars, template: &'a str, ctx: &'a Value, output_file: &'a str) {
     let mut file = match File::create(output_file) {
         Err(why) => panic!("couldn't create {}: {}", output_file, why.description()),
@@ -249,19 +364,19 @@ fn fork_child(cmd: String, debug: bool) {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        {
-            Err(why) => panic!(
-                "couldn't spawn watch process {}: {}",
-                cmd,
-                why.description()
-            ),
-            Ok(child) => {
-                if debug {
-                    println!("DEBUG: watch process pid {} started", child.id());
-                }
-                child
+    {
+        Err(why) => panic!(
+            "couldn't spawn watch process {}: {}",
+            cmd,
+            why.description()
+        ),
+        Ok(child) => {
+            if debug {
+                println!("DEBUG: watch process pid {} started", child.id());
             }
-        };
+            child
+        }
+    };
     std::thread::spawn(move || {
         let child_id = child.id();
         match child.wait() {
@@ -286,12 +401,17 @@ fn fork_child(cmd: String, debug: bool) {
     });
 }
 
-fn eval_helper(h: &Helper, _: &Handlebars, _: &Context, _: &mut RenderContext, out: &mut Output) -> HelperResult {
-    let expr = h.params()
+fn eval_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut Output,
+) -> HelperResult {
+    let expr = h
+        .params()
         .iter()
-        .map(|v| {
-            v.value().render()
-        })
+        .map(|v| v.value().render())
         .collect::<Vec<String>>()
         .join(" ");
     let res = meval::eval_str(expr)
@@ -301,7 +421,6 @@ fn eval_helper(h: &Helper, _: &Handlebars, _: &Context, _: &mut RenderContext, o
     try!(out.write(&res));
     Ok(())
 }
-
 
 fn main() {
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -349,7 +468,7 @@ fn main() {
     };
     let time_multiplier = match matches.opt_present("use-millis") {
         true => 1,
-        false => 1000
+        false => 1000,
     };
     let timeout: u64 = match matches.opt_str("t") {
         Some(seconds) => match seconds.parse::<u64>() {
@@ -375,7 +494,7 @@ fn main() {
             let m = matches.clone();
             let ctx = &match first {
                 true => evaluate_empty(&m),
-                false => evaluate(&m, timeout, debug)
+                false => evaluate(&m, timeout, debug),
             };
             first = false;
             let old_ctx = ctx.clone();
