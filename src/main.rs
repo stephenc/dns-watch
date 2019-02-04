@@ -10,6 +10,7 @@ extern crate domain;
 extern crate getopts;
 extern crate handlebars;
 extern crate meval;
+extern crate regex;
 extern crate serde;
 extern crate serde_json;
 
@@ -33,7 +34,9 @@ use domain::resolv::stub::resolver::StubResolver;
 use getopts::Matches;
 use getopts::Options;
 use handlebars::JsonRender;
+use handlebars::RenderError;
 use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
+use regex::Regex;
 use serde_json::map::Map;
 use serde_json::Value;
 
@@ -418,8 +421,82 @@ fn eval_helper(
         .map(|v| v as i64)
         .map(|v| format!("{}", v))
         .unwrap();
-    try!(out.write(&res));
-    Ok(())
+    match out.write(&res) {
+        Err(e) => Err(RenderError::with(e)),
+        Ok(_) => Ok(()),
+    }
+}
+
+fn replace_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut Output,
+) -> HelperResult {
+    let value = match h.param(0) {
+        Some(v) => v.value().render(),
+        None => return Err(RenderError::new("value param not found")),
+    };
+    let regex = match Regex::new(
+        match h.param(1) {
+            Some(v) => v.value().render(),
+            None => return Err(RenderError::new("regex param not found")),
+        }
+        .as_str(),
+    ) {
+        Ok(r) => r,
+        Err(e) => return Err(RenderError::with(e)),
+    };
+    let replacement = match h.param(2) {
+        Some(v) => v.value().render(),
+        None => "".to_string(),
+    };
+    match out.write(
+        regex
+            .replace(&value, replacement.as_str())
+            .to_string()
+            .as_str(),
+    ) {
+        Err(e) => Err(RenderError::with(e)),
+        Ok(_) => Ok(()),
+    }
+}
+
+fn replace_all_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut Output,
+) -> HelperResult {
+    let value = match h.param(0) {
+        Some(v) => v.value().render(),
+        None => return Err(RenderError::new("value param not found")),
+    };
+    let regex = match Regex::new(
+        match h.param(1) {
+            Some(v) => v.value().render(),
+            None => return Err(RenderError::new("regex param not found")),
+        }
+        .as_str(),
+    ) {
+        Ok(r) => r,
+        Err(e) => return Err(RenderError::with(e)),
+    };
+    let replacement = match h.param(2) {
+        Some(v) => v.value().render(),
+        None => "".to_string(),
+    };
+    match out.write(
+        regex
+            .replace_all(&value, replacement.as_str())
+            .to_string()
+            .as_str(),
+    ) {
+        Err(e) => Err(RenderError::with(e)),
+        Ok(_) => Ok(()),
+    }
 }
 
 fn main() {
@@ -448,6 +525,8 @@ fn main() {
 
     let mut handlebars = Handlebars::new();
     handlebars.register_helper("eval", Box::new(eval_helper));
+    handlebars.register_helper("replace", Box::new(replace_helper));
+    handlebars.register_helper("replace_all", Box::new(replace_all_helper));
     match handlebars.register_template_file("template", Path::new(&matches.free[0])) {
         Ok(_) => (),
         Err(f) => panic!(f.to_string()),
@@ -514,9 +593,14 @@ fn main() {
         let m = matches.clone();
         let ctx = &evaluate(&m, timeout, debug);
         if output_file.eq("-") {
-            handlebars
-                .render_to_write("template", &ctx, &mut io::stdout())
-                .expect("Template failed to render");
+            match handlebars.render_to_write("template", &ctx, &mut io::stdout()) {
+                Err(why) => panic!(
+                    "couldn't render template {}: {}",
+                    output_file,
+                    why.description()
+                ),
+                Ok(_) => (),
+            }
         } else {
             render(&handlebars, "template", ctx, &output_file);
         }
