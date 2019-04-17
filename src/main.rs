@@ -417,10 +417,12 @@ fn eval_helper(
         .map(|v| v.value().render())
         .collect::<Vec<String>>()
         .join(" ");
-    let res = meval::eval_str(expr)
+    let res = match meval::eval_str(expr)
         .map(|v| v as i64)
-        .map(|v| format!("{}", v))
-        .unwrap();
+        .map(|v| format!("{}", v)) {
+        Ok(r) => r,
+        Err(e) => return Err(RenderError::with(e)),
+    };
     match out.write(&res) {
         Err(e) => Err(RenderError::with(e)),
         Ok(_) => Ok(()),
