@@ -33,9 +33,9 @@ use domain::resolv::stub::conf::ResolvConf;
 use domain::resolv::stub::resolver::StubResolver;
 use getopts::Matches;
 use getopts::Options;
+use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
 use handlebars::JsonRender;
 use handlebars::RenderError;
-use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext};
 use regex::Regex;
 use serde_json::map::Map;
 use serde_json::Value;
@@ -465,6 +465,39 @@ fn replace_helper(
     }
 }
 
+fn matches_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut Output,
+) -> HelperResult {
+    let value = match h.param(0) {
+        Some(v) => v.value().render(),
+        None => return Err(RenderError::new("value param not found")),
+    };
+    let regex = match Regex::new(
+        match h.param(1) {
+            Some(v) => v.value().render(),
+            None => return Err(RenderError::new("regex param not found")),
+        }
+            .as_str(),
+    ) {
+        Ok(r) => r,
+        Err(e) => return Err(RenderError::with(e)),
+    };
+    match out.write(
+        match regex.find(&value) {
+            Some(_) => "true",
+            None => ""
+        }.to_string()
+            .as_str(),
+    ) {
+        Err(e) => Err(RenderError::with(e)),
+        Ok(_) => Ok(()),
+    }
+}
+
 fn replace_all_helper(
     h: &Helper,
     _: &Handlebars,
@@ -529,6 +562,7 @@ fn main() {
     handlebars.register_helper("eval", Box::new(eval_helper));
     handlebars.register_helper("replace", Box::new(replace_helper));
     handlebars.register_helper("replace_all", Box::new(replace_all_helper));
+    handlebars.register_helper("matches", Box::new(matches_helper));
     match handlebars.register_template_file("template", Path::new(&matches.free[0])) {
         Ok(_) => (),
         Err(f) => panic!(f.to_string()),
